@@ -245,7 +245,7 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
 }
 
 /* Convert a BBR bw and gain factor to a pacing rate in bytes per second. */
-static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
+static u32 bbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
 	u64 rate = bw;
 
@@ -284,7 +284,7 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
-	unsigned long rate = bbr_bw_to_pacing_rate(sk, bw, gain);
+	u32 rate = bbr_bw_to_pacing_rate(sk, bw, gain);
 
 	if (unlikely(!bbr->has_seen_rtt && tp->srtt_us))
 		bbr_init_pacing_rate_from_rtt(sk);
@@ -292,40 +292,25 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 		sk->sk_pacing_rate = rate;
 }
 
+/* override sysctl_tcp_min_tso_segs */
 static u32 bbr_min_tso_segs(struct sock *sk)
 {
 	return sk->sk_pacing_rate < (bbr_min_tso_rate >> 3) ? 1 : 2;
 }
 
-/* Return the number of segments BBR would like in a TSO/GSO skb, given
- * a particular max gso size as a constraint.
- */
-static u32 bbr_tso_segs_generic(struct sock *sk, unsigned int mss_now,
-				u32 gso_max_size)
-{
-	u32 segs;
-	u64 bytes;
-
-	/* Budget a TSO/GSO burst size allowance based on bw (pacing_rate). */
-	bytes = sk->sk_pacing_rate >> sk->sk_pacing_shift;
-
-	bytes = min_t(u32, bytes, gso_max_size - 1 - MAX_TCP_HEADER);
-	segs = max_t(u32, bytes / mss_now, bbr_min_tso_segs(sk));
-	return segs;
-}
-
-/* Custom tcp_tso_autosize() for BBR, used at transmit time to cap skb size. */
-static u32  bbr_tso_segs(struct sock *sk, unsigned int mss_now)
-{
-	return bbr_tso_segs_generic(sk, mss_now, sk->sk_gso_max_size);
-}
-
-/* Like bbr_tso_segs(), using mss_cache, ignoring driver's sk_gso_max_size. */
 static u32 bbr_tso_segs_goal(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
+	u32 segs, bytes;
 
-	return  bbr_tso_segs_generic(sk, tp->mss_cache, GSO_MAX_SIZE);
+	/* Sort of tcp_tso_autosize() but ignoring
+	 * driver provided sk_gso_max_size.
+	 */
+	bytes = min_t(u32, sk->sk_pacing_rate >> sk->sk_pacing_shift,
+		      GSO_MAX_SIZE - 1 - MAX_TCP_HEADER);
+	segs = max_t(u32, bytes / tp->mss_cache, bbr_min_tso_segs(sk));
+
+	return min(segs, 0x7FU);
 }
 
 /* Save "last known good" cwnd so we can restore it after losses or PROBE_RTT */
@@ -401,7 +386,7 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
  * which allows 2 outstanding 2-packet sequences, to try to keep pipe
  * full even with ACK-every-other-packet delayed ACKs.
  */
-static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd)
+static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd, int gain)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 
@@ -412,7 +397,7 @@ static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd)
 	cwnd = (cwnd + 1) & ~1U;
 
 	/* Ensure gain cycling gets inflight above BDP even for small BDPs. */
-	if (bbr->mode == BBR_PROBE_BW && bbr->cycle_idx == 0)
+	if (bbr->mode == BBR_PROBE_BW && gain > BBR_UNIT)
 		cwnd += 2;
 
 	return cwnd;
@@ -424,7 +409,7 @@ static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
 	u32 inflight;
 
 	inflight = bbr_bdp(sk, bw, gain);
-	inflight = bbr_quantization_budget(sk, inflight);
+	inflight = bbr_quantization_budget(sk, inflight, gain);
 
 	return inflight;
 }
@@ -511,7 +496,7 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 	 * due to aggregation (of data and/or ACKs) visible in the ACK stream.
 	 */
 	target_cwnd += bbr_ack_aggregation_cwnd(sk);
-	target_cwnd = bbr_quantization_budget(sk, target_cwnd);
+	target_cwnd = bbr_quantization_budget(sk, target_cwnd, gain);
 
 	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
 	if (bbr_full_bw_reached(sk))  /* only cut cwnd if we filled the pipe */
@@ -1126,7 +1111,7 @@ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
 	.undo_cwnd	= bbr_undo_cwnd,
 	.cwnd_event	= bbr_cwnd_event,
 	.ssthresh	= bbr_ssthresh,
-	.tso_segs	= bbr_tso_segs,
+	.min_tso_segs	= bbr_min_tso_segs,
 	.get_info	= bbr_get_info,
 	.set_state	= bbr_set_state,
 };
