@@ -317,7 +317,7 @@ compound_page_dtor * const compound_page_dtors[] = {
  * allocations below this point, only high priority ones. Automatically
  * tuned according to the amount of memory in the system.
  */
-int min_free_kbytes = 10900;
+int min_free_kbytes = 8912;
 int user_min_free_kbytes = -1;
 int watermark_scale_factor = 500;
 
